@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Best-effort UNIMEP handshake tester for Raspberry Pi + USB-RS485.
+"""UNIMEP handshake tester for Raspberry Pi + USB-RS485.
 
-This script is based on the application-layer details in `UnimepProtocol.pdf`.
-That document says CRC, parity, and block sequence belong to the lower "line
-protocol" and does not fully define them, so the line frame used here is an
-assumption based on the examples in the PDF:
+This script combines:
+- `UnimepProtocol.pdf` for the application transactions
+- `unimep_prot_summary .pdf` for the line framing and poll/ack flow
 
-- Pump address: 0x50-0x6F
-- Control/sequence byte: 0x30 | (seq & 0x0F)
-- Command transaction: CD1 = 0x01, LEN = 0x01, DCC = 0x00 (RETURN STATUS)
-- Trailer bytes: CRC low, CRC high, ETX=0x03, SF=0xFA
-
-If your pump does not answer, the most likely mismatch is the CRC algorithm,
-serial parameters, or the exact line-protocol framing.
+Important protocol details from the summary examples:
+- short messages:
+  - POLL      = ADR, 20, FA
+  - ACK       = ADR, CX, FA
+  - ACK_POLL  = ADR, EX, FA
+  - EOT       = ADR, 70, FA
+- long messages:
+  - ADR, 3X, TYPE, LEN, DATA..., CRC_LO, CRC_HI, 03, FA
+- CRC is CRC-16/IBM reflected (poly 0xA001) with init=0x0000
+- a long controller command gets a short ACK from the pump
+- the controller then uses POLL to fetch the actual data/status packet
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ STATUS_NAMES = {
 
 ETX = 0x03
 SF = 0xFA
+DLE = 0x10
 COMMON_SERIAL_PROFILES = (
     (9600, 8, "N", 1),
     (9600, 7, "E", 1),
@@ -46,6 +50,19 @@ COMMON_SERIAL_PROFILES = (
     (2400, 8, "N", 1),
     (2400, 7, "E", 1),
 )
+
+
+def crc16_dart(data: bytes) -> int:
+    """CRC-16/IBM reflected with init=0x0000, per summary examples."""
+    crc = 0x0000
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -85,6 +102,7 @@ def crc16_x25(data: bytes) -> int:
 
 
 CRC_FUNCTIONS = {
+    "dart": crc16_dart,
     "modbus": crc16_modbus,
     "ccitt-false": crc16_ccitt_false,
     "x25": crc16_x25,
@@ -123,6 +141,15 @@ def build_return_status_transaction() -> bytes:
     return bytes([0x01, 0x01, 0x00])
 
 
+def stuff_crc_bytes(crc_lo: int, crc_hi: int) -> bytes:
+    stuffed = bytearray()
+    for byte in (crc_lo, crc_hi):
+        if byte == SF:
+            stuffed.append(DLE)
+        stuffed.append(byte)
+    return bytes(stuffed)
+
+
 def build_line_frame(
     pump_address: int,
     payload: bytes,
@@ -134,7 +161,15 @@ def build_line_frame(
     crc_value = CRC_FUNCTIONS[crc_name](body)
     crc_lo = crc_value & 0xFF
     crc_hi = (crc_value >> 8) & 0xFF
-    return body + bytes([crc_lo, crc_hi, ETX, SF])
+    return body + stuff_crc_bytes(crc_lo, crc_hi) + bytes([ETX, SF])
+
+
+def build_poll(pump_address: int) -> bytes:
+    return bytes([pump_address, 0x20, SF])
+
+
+def build_ack(pump_address: int, sequence: int) -> bytes:
+    return bytes([pump_address, 0xC0 | (sequence & 0x0F), SF])
 
 
 def parse_transactions(payload: bytes) -> list[str]:
@@ -195,12 +230,34 @@ def parse_transactions(payload: bytes) -> list[str]:
 
 def extract_payload_from_reply(reply: bytes) -> bytes:
     if len(reply) >= 4 and reply[-2:] == bytes([ETX, SF]):
-        # Assumed format: ADR, CTRL/SEQ, PAYLOAD..., CRC_LO, CRC_HI, ETX, SF
+        # Long frame: ADR, CTRL/SEQ, PAYLOAD..., CRC_LO, CRC_HI, ETX, SF
         if len(reply) >= 6:
-            return reply[2:-4]
+            body = reply[:-2].replace(bytes([DLE, SF]), bytes([SF]))
+            return body[2:-2]
         return b""
     # Fallback: parse whole buffer as transactions if the device returns raw payload.
     return reply
+
+
+def describe_short_message(reply: bytes) -> str | None:
+    if len(reply) != 3 or reply[-1] != SF:
+        return None
+    adr, msg_type, _ = reply
+    if msg_type == 0x20:
+        return f"SHORT POLL from 0x{adr:02X}"
+    if msg_type == 0x70:
+        return f"SHORT EOT from 0x{adr:02X}"
+    if 0xC0 <= msg_type <= 0xCF:
+        return f"SHORT ACK from 0x{adr:02X}, seq={msg_type & 0x0F}"
+    if 0xE0 <= msg_type <= 0xEF:
+        return f"SHORT ACK_POLL from 0x{adr:02X}, seq={msg_type & 0x0F}"
+    return f"SHORT unknown from 0x{adr:02X}: {hexdump(reply)}"
+
+
+def get_long_frame_sequence(reply: bytes) -> int | None:
+    if len(reply) >= 4 and reply[-2:] == bytes([ETX, SF]) and (reply[1] & 0xF0) == 0x30:
+        return reply[1] & 0x0F
+    return None
 
 
 def open_serial_profile(
@@ -276,6 +333,10 @@ def try_handshake(
 
 def decode_and_print_reply(reply: bytes) -> None:
     print(f"Raw reply: {hexdump(reply)}")
+    short_desc = describe_short_message(reply)
+    if short_desc is not None:
+        print(f"- {short_desc}")
+        return
     payload = extract_payload_from_reply(reply)
     decoded = parse_transactions(payload)
     if decoded:
@@ -305,6 +366,47 @@ def listen_mode(args: argparse.Namespace) -> int:
 
     decode_and_print_reply(reply)
     return 0
+
+
+def run_status_exchange(
+    ser: serial.Serial,
+    pump_address: int,
+    sequence: int,
+    crc_name: str,
+    timeout: float,
+    poll_count: int,
+) -> bytes:
+    command = build_line_frame(
+        pump_address=pump_address,
+        payload=build_return_status_transaction(),
+        sequence=sequence,
+        crc_name=crc_name,
+    )
+    print(f"Sending RETURN STATUS: {hexdump(command)}")
+    first_reply = try_handshake(ser, command, timeout_seconds=timeout)
+    if not first_reply:
+        return b""
+
+    decode_and_print_reply(first_reply)
+
+    for poll_index in range(1, poll_count + 1):
+        poll = build_poll(pump_address)
+        print(f"Sending POLL {poll_index}: {hexdump(poll)}")
+        reply = try_handshake(ser, poll, timeout_seconds=timeout)
+        if not reply:
+            continue
+
+        decode_and_print_reply(reply)
+        long_seq = get_long_frame_sequence(reply)
+        if long_seq is not None:
+            ack = build_ack(pump_address, long_seq)
+            print(f"Sending ACK for seq={long_seq}: {hexdump(ack)}")
+            ser.reset_input_buffer()
+            ser.write(ack)
+            ser.flush()
+            return reply
+
+    return first_reply
 
 
 def probe_with_serial_profile(
@@ -339,26 +441,17 @@ def probe_with_serial_profile(
         for address in addresses:
             for sequence in sequences:
                 for crc_name in crc_names:
-                    request = build_line_frame(
+                    print(f"Trying addr=0x{address:02X} seq={sequence} crc={crc_name}")
+                    reply = run_status_exchange(
+                        ser=ser,
                         pump_address=address,
-                        payload=transaction,
                         sequence=sequence,
                         crc_name=crc_name,
-                    )
-                    print(
-                        f"Trying addr=0x{address:02X} seq={sequence} "
-                        f"crc={crc_name}: {hexdump(request)}"
-                    )
-                    reply = try_handshake(
-                        ser,
-                        request,
-                        timeout_seconds=timeout,
+                        timeout=timeout,
+                        poll_count=args.poll_count,
                     )
                     if reply:
-                        print(
-                            f"Reply received with addr=0x{address:02X} "
-                            f"seq={sequence} crc={crc_name}"
-                        )
+                        print(f"Response received with addr=0x{address:02X} seq={sequence} crc={crc_name}")
                         return reply
                     time.sleep(0.2)
     return b""
@@ -376,10 +469,11 @@ def main() -> int:
     parser.add_argument(
         "--crc",
         choices=sorted(CRC_FUNCTIONS.keys()),
-        default="modbus",
+        default="dart",
         help="Assumed line-protocol CRC",
     )
-    parser.add_argument("--sequence", type=int, default=0, help="Low nibble of control/seq byte")
+    parser.add_argument("--sequence", type=int, default=1, help="Low nibble of control/seq byte")
+    parser.add_argument("--poll-count", type=int, default=2, help="How many POLL requests to send after the command")
     parser.add_argument(
         "--raw-payload",
         action="store_true",

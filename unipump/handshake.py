@@ -409,6 +409,34 @@ def run_status_exchange(
     return first_reply
 
 
+def run_poll_only(
+    ser: serial.Serial,
+    pump_address: int,
+    timeout: float,
+    poll_count: int,
+) -> bytes:
+    last_reply = b""
+    for poll_index in range(1, poll_count + 1):
+        poll = build_poll(pump_address)
+        print(f"Sending POLL {poll_index}: {hexdump(poll)}")
+        reply = try_handshake(ser, poll, timeout_seconds=timeout)
+        if not reply:
+            continue
+
+        decode_and_print_reply(reply)
+        last_reply = reply
+
+        long_seq = get_long_frame_sequence(reply)
+        if long_seq is not None:
+            ack = build_ack(pump_address, long_seq)
+            print(f"Sending ACK for seq={long_seq}: {hexdump(ack)}")
+            ser.reset_input_buffer()
+            ser.write(ack)
+            ser.flush()
+
+    return last_reply
+
+
 def probe_with_serial_profile(
     port: str,
     baudrate: int,
@@ -429,6 +457,22 @@ def probe_with_serial_profile(
         stopbits=stopbits,
         timeout=timeout,
     ) as ser:
+        if args.poll_only:
+            addresses = range(0x50, 0x70) if args.scan_addresses else [pump_address]
+            for address in addresses:
+                print(f"Trying POLL addr=0x{address:02X}")
+                reply = run_poll_only(
+                    ser=ser,
+                    pump_address=address,
+                    timeout=timeout,
+                    poll_count=args.poll_count,
+                )
+                if reply:
+                    print(f"Response received with POLL addr=0x{address:02X}")
+                    return reply
+                time.sleep(0.2)
+            return b""
+
         if args.raw_payload:
             request = transaction
             print(f"Handshake request: {hexdump(request)}")
@@ -474,6 +518,11 @@ def main() -> int:
     )
     parser.add_argument("--sequence", type=int, default=1, help="Low nibble of control/seq byte")
     parser.add_argument("--poll-count", type=int, default=2, help="How many POLL requests to send after the command")
+    parser.add_argument(
+        "--poll-only",
+        action="store_true",
+        help="Only send short POLL frames and print EOT/data replies",
+    )
     parser.add_argument(
         "--raw-payload",
         action="store_true",

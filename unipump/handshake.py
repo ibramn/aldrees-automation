@@ -38,6 +38,14 @@ STATUS_NAMES = {
 
 ETX = 0x03
 SF = 0xFA
+COMMON_SERIAL_PROFILES = (
+    (9600, 8, "N", 1),
+    (9600, 7, "E", 1),
+    (4800, 8, "N", 1),
+    (4800, 7, "E", 1),
+    (2400, 8, "N", 1),
+    (2400, 7, "E", 1),
+)
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -195,7 +203,14 @@ def extract_payload_from_reply(reply: bytes) -> bytes:
     return reply
 
 
-def open_serial(args: argparse.Namespace) -> serial.Serial:
+def open_serial_profile(
+    port: str,
+    baudrate: int,
+    bytesize: int,
+    parity: str,
+    stopbits: float,
+    timeout: float,
+) -> serial.Serial:
     parity_map = {
         "N": serial.PARITY_NONE,
         "E": serial.PARITY_EVEN,
@@ -206,26 +221,43 @@ def open_serial(args: argparse.Namespace) -> serial.Serial:
         8: serial.EIGHTBITS,
     }
     return serial.Serial(
-        port=args.port,
-        baudrate=args.baudrate,
-        bytesize=bytesize_map[args.bytesize],
-        parity=parity_map[args.parity],
-        stopbits=args.stopbits,
-        timeout=args.timeout,
-        write_timeout=args.timeout,
+        port=port,
+        baudrate=baudrate,
+        bytesize=bytesize_map[bytesize],
+        parity=parity_map[parity],
+        stopbits=stopbits,
+        timeout=timeout,
+        write_timeout=timeout,
     )
 
 
-def read_reply(ser: serial.Serial, timeout_seconds: float) -> bytes:
+def open_serial(args: argparse.Namespace) -> serial.Serial:
+    return open_serial_profile(
+        port=args.port,
+        baudrate=args.baudrate,
+        bytesize=args.bytesize,
+        parity=args.parity,
+        stopbits=args.stopbits,
+        timeout=args.timeout,
+    )
+
+
+def read_reply(ser: serial.Serial, timeout_seconds: float, idle_gap: float = 0.25) -> bytes:
     deadline = time.monotonic() + timeout_seconds
     received = bytearray()
+    last_data_at: float | None = None
     while time.monotonic() < deadline:
         chunk = ser.read(256)
         if chunk:
             received.extend(chunk)
+            last_data_at = time.monotonic()
             if received.endswith(bytes([ETX, SF])):
                 break
+            if last_data_at is not None and (time.monotonic() - last_data_at) >= idle_gap:
+                break
         else:
+            if received and last_data_at is not None and (time.monotonic() - last_data_at) >= idle_gap:
+                break
             time.sleep(0.05)
     return bytes(received)
 
@@ -240,6 +272,96 @@ def try_handshake(
     ser.write(request)
     ser.flush()
     return read_reply(ser, timeout_seconds=timeout_seconds)
+
+
+def decode_and_print_reply(reply: bytes) -> None:
+    print(f"Raw reply: {hexdump(reply)}")
+    payload = extract_payload_from_reply(reply)
+    decoded = parse_transactions(payload)
+    if decoded:
+        for line in decoded:
+            print(f"- {line}")
+    else:
+        print("No decodable transactions found in reply payload.")
+
+
+def listen_mode(args: argparse.Namespace) -> int:
+    print(
+        f"Listening on {args.port} @ "
+        f"{args.baudrate},{args.bytesize}{args.parity}{int(args.stopbits)} "
+        f"for {args.listen_seconds:.1f}s"
+    )
+    try:
+        with open_serial(args) as ser:
+            ser.reset_input_buffer()
+            reply = read_reply(ser, timeout_seconds=args.listen_seconds, idle_gap=0.5)
+    except serial.SerialException as exc:
+        print(f"serial error: {exc}", file=sys.stderr)
+        return 1
+
+    if not reply:
+        print("No traffic observed.")
+        return 1
+
+    decode_and_print_reply(reply)
+    return 0
+
+
+def probe_with_serial_profile(
+    port: str,
+    baudrate: int,
+    bytesize: int,
+    parity: str,
+    stopbits: float,
+    timeout: float,
+    transaction: bytes,
+    pump_address: int,
+    args: argparse.Namespace,
+) -> bytes:
+    print(f"Opening {port} @ {baudrate},{bytesize}{parity}{int(stopbits)}")
+    with open_serial_profile(
+        port=port,
+        baudrate=baudrate,
+        bytesize=bytesize,
+        parity=parity,
+        stopbits=stopbits,
+        timeout=timeout,
+    ) as ser:
+        if args.raw_payload:
+            request = transaction
+            print(f"Handshake request: {hexdump(request)}")
+            return try_handshake(ser, request, timeout_seconds=timeout)
+
+        addresses = range(0x50, 0x70) if args.scan_addresses else [pump_address]
+        sequences = range(16) if args.try_all_sequences else [args.sequence]
+        crc_names = CRC_FUNCTIONS.keys() if args.try_all_crc else [args.crc]
+
+        for address in addresses:
+            for sequence in sequences:
+                for crc_name in crc_names:
+                    request = build_line_frame(
+                        pump_address=address,
+                        payload=transaction,
+                        sequence=sequence,
+                        crc_name=crc_name,
+                    )
+                    print(
+                        f"Trying addr=0x{address:02X} seq={sequence} "
+                        f"crc={crc_name}: {hexdump(request)}"
+                    )
+                    reply = try_handshake(
+                        ser,
+                        request,
+                        timeout_seconds=timeout,
+                    )
+                    if reply:
+                        print(
+                            f"Reply received with addr=0x{address:02X} "
+                            f"seq={sequence} crc={crc_name}"
+                        )
+                        return reply
+                    time.sleep(0.2)
+    return b""
 
 
 def main() -> int:
@@ -278,6 +400,17 @@ def main() -> int:
         action="store_true",
         help="Try all pump addresses from 0x50 to 0x6F",
     )
+    parser.add_argument(
+        "--sweep-common-configs",
+        action="store_true",
+        help="Try common serial settings: 9600/4800/2400 with 8N1 and 7E1",
+    )
+    parser.add_argument(
+        "--listen-seconds",
+        type=float,
+        default=0.0,
+        help="Listen only for incoming traffic for N seconds",
+    )
     args = parser.parse_args()
 
     try:
@@ -290,53 +423,40 @@ def main() -> int:
         print("pump address must be between 0x50 and 0x6F", file=sys.stderr)
         return 2
 
+    if args.listen_seconds > 0:
+        return listen_mode(args)
+
     transaction = build_return_status_transaction()
-    print(
-        f"Opening {args.port} @ "
-        f"{args.baudrate},{args.bytesize}{args.parity}{int(args.stopbits)}"
-    )
 
     try:
-        with open_serial(args) as ser:
-            if args.raw_payload:
-                request = transaction
-                print(f"Handshake request: {hexdump(request)}")
-                reply = try_handshake(ser, request, timeout_seconds=args.timeout)
-            else:
-                reply = b""
-                addresses = range(0x50, 0x70) if args.scan_addresses else [pump_address]
-                sequences = range(16) if args.try_all_sequences else [args.sequence]
-                crc_names = CRC_FUNCTIONS.keys() if args.try_all_crc else [args.crc]
-
-                for address in addresses:
-                    for sequence in sequences:
-                        for crc_name in crc_names:
-                            request = build_line_frame(
-                                pump_address=address,
-                                payload=transaction,
-                                sequence=sequence,
-                                crc_name=crc_name,
-                            )
-                            print(
-                                f"Trying addr=0x{address:02X} seq={sequence} "
-                                f"crc={crc_name}: {hexdump(request)}"
-                            )
-                            reply = try_handshake(
-                                ser,
-                                request,
-                                timeout_seconds=args.timeout,
-                            )
-                            if reply:
-                                print(
-                                    f"Reply received with addr=0x{address:02X} "
-                                    f"seq={sequence} crc={crc_name}"
-                                )
-                                break
-                            time.sleep(0.2)
-                        if reply:
-                            break
-                    if reply:
-                        break
+        reply = b""
+        if args.sweep_common_configs:
+            for baudrate, bytesize, parity, stopbits in COMMON_SERIAL_PROFILES:
+                reply = probe_with_serial_profile(
+                    port=args.port,
+                    baudrate=baudrate,
+                    bytesize=bytesize,
+                    parity=parity,
+                    stopbits=stopbits,
+                    timeout=args.timeout,
+                    transaction=transaction,
+                    pump_address=pump_address,
+                    args=args,
+                )
+                if reply:
+                    break
+        else:
+            reply = probe_with_serial_profile(
+                port=args.port,
+                baudrate=args.baudrate,
+                bytesize=args.bytesize,
+                parity=args.parity,
+                stopbits=args.stopbits,
+                timeout=args.timeout,
+                transaction=transaction,
+                pump_address=pump_address,
+                args=args,
+            )
     except serial.SerialException as exc:
         print(f"serial error: {exc}", file=sys.stderr)
         return 1
@@ -349,15 +469,7 @@ def main() -> int:
         )
         return 1
 
-    print(f"Raw reply: {hexdump(reply)}")
-    payload = extract_payload_from_reply(reply)
-    decoded = parse_transactions(payload)
-
-    if decoded:
-        for line in decoded:
-            print(f"- {line}")
-    else:
-        print("No decodable transactions found in reply payload.")
+    decode_and_print_reply(reply)
 
     return 0
 

@@ -27,6 +27,11 @@ from typing import Iterable
 
 import serial
 
+try:
+    from serial.rs485 import RS485Settings
+except ImportError:  # pragma: no cover - depends on pyserial build/platform
+    RS485Settings = None
+
 
 STATUS_NAMES = {
     0x00: "PUMP NOT PROGRAMMED",
@@ -260,6 +265,59 @@ def get_long_frame_sequence(reply: bytes) -> int | None:
     return None
 
 
+def split_stream_frames(data: bytes) -> list[bytes]:
+    frames: list[bytes] = []
+    idx = 0
+    while idx < len(data):
+        if (
+            idx + 2 < len(data)
+            and 0x50 <= data[idx] <= 0x6F
+            and data[idx + 2] == SF
+        ):
+            msg_type = data[idx + 1]
+            if msg_type in (0x20, 0x70) or 0xC0 <= msg_type <= 0xCF or 0xE0 <= msg_type <= 0xEF:
+                frames.append(data[idx : idx + 3])
+                idx += 3
+                continue
+
+        if (
+            idx + 3 < len(data)
+            and 0x50 <= data[idx] <= 0x6F
+            and (data[idx + 1] & 0xF0) == 0x30
+        ):
+            end = idx + 2
+            while end + 1 < len(data):
+                if data[end] == ETX and data[end + 1] == SF:
+                    frames.append(data[idx : end + 2])
+                    idx = end + 2
+                    break
+                end += 1
+            else:
+                break
+            continue
+
+        idx += 1
+
+    if not frames and data:
+        return [data]
+    return frames
+
+
+def apply_rs485_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
+    if not args.rs485_mode:
+        return
+    if RS485Settings is None:
+        raise RuntimeError("pyserial RS485Settings is not available on this system")
+
+    ser.rs485_mode = RS485Settings(
+        rts_level_for_tx=bool(args.rs485_rts_level_tx),
+        rts_level_for_rx=bool(args.rs485_rts_level_rx),
+        loopback=False,
+        delay_before_tx=args.rs485_delay_before_tx or None,
+        delay_before_rx=args.rs485_delay_before_rx or None,
+    )
+
+
 def open_serial_profile(
     port: str,
     baudrate: int,
@@ -267,6 +325,7 @@ def open_serial_profile(
     parity: str,
     stopbits: float,
     timeout: float,
+    args: argparse.Namespace,
 ) -> serial.Serial:
     parity_map = {
         "N": serial.PARITY_NONE,
@@ -277,7 +336,7 @@ def open_serial_profile(
         7: serial.SEVENBITS,
         8: serial.EIGHTBITS,
     }
-    return serial.Serial(
+    ser = serial.Serial(
         port=port,
         baudrate=baudrate,
         bytesize=bytesize_map[bytesize],
@@ -286,6 +345,8 @@ def open_serial_profile(
         timeout=timeout,
         write_timeout=timeout,
     )
+    apply_rs485_mode(ser, args)
+    return ser
 
 
 def open_serial(args: argparse.Namespace) -> serial.Serial:
@@ -296,6 +357,7 @@ def open_serial(args: argparse.Namespace) -> serial.Serial:
         parity=args.parity,
         stopbits=args.stopbits,
         timeout=args.timeout,
+        args=args,
     )
 
 
@@ -323,15 +385,20 @@ def try_handshake(
     ser: serial.Serial,
     request: bytes,
     timeout_seconds: float,
+    args: argparse.Namespace,
 ) -> bytes:
     ser.reset_input_buffer()
     ser.reset_output_buffer()
+    if args.pre_tx_delay > 0:
+        time.sleep(args.pre_tx_delay)
     ser.write(request)
     ser.flush()
+    if args.post_tx_delay > 0:
+        time.sleep(args.post_tx_delay)
     return read_reply(ser, timeout_seconds=timeout_seconds)
 
 
-def decode_and_print_reply(reply: bytes) -> None:
+def decode_single_reply(reply: bytes) -> None:
     print(f"Raw reply: {hexdump(reply)}")
     short_desc = describe_short_message(reply)
     if short_desc is not None:
@@ -344,6 +411,17 @@ def decode_and_print_reply(reply: bytes) -> None:
             print(f"- {line}")
     else:
         print("No decodable transactions found in reply payload.")
+
+
+def decode_and_print_reply(reply: bytes) -> None:
+    frames = split_stream_frames(reply)
+    if len(frames) <= 1:
+        decode_single_reply(reply)
+        return
+
+    for index, frame in enumerate(frames, start=1):
+        print(f"[frame {index}]")
+        decode_single_reply(frame)
 
 
 def listen_mode(args: argparse.Namespace) -> int:
@@ -375,6 +453,7 @@ def run_status_exchange(
     crc_name: str,
     timeout: float,
     poll_count: int,
+    args: argparse.Namespace,
 ) -> bytes:
     command = build_line_frame(
         pump_address=pump_address,
@@ -383,7 +462,7 @@ def run_status_exchange(
         crc_name=crc_name,
     )
     print(f"Sending RETURN STATUS: {hexdump(command)}")
-    first_reply = try_handshake(ser, command, timeout_seconds=timeout)
+    first_reply = try_handshake(ser, command, timeout_seconds=timeout, args=args)
     if not first_reply:
         return b""
 
@@ -392,7 +471,7 @@ def run_status_exchange(
     for poll_index in range(1, poll_count + 1):
         poll = build_poll(pump_address)
         print(f"Sending POLL {poll_index}: {hexdump(poll)}")
-        reply = try_handshake(ser, poll, timeout_seconds=timeout)
+        reply = try_handshake(ser, poll, timeout_seconds=timeout, args=args)
         if not reply:
             continue
 
@@ -402,8 +481,12 @@ def run_status_exchange(
             ack = build_ack(pump_address, long_seq)
             print(f"Sending ACK for seq={long_seq}: {hexdump(ack)}")
             ser.reset_input_buffer()
+            if args.pre_tx_delay > 0:
+                time.sleep(args.pre_tx_delay)
             ser.write(ack)
             ser.flush()
+            if args.post_tx_delay > 0:
+                time.sleep(args.post_tx_delay)
             return reply
 
     return first_reply
@@ -414,12 +497,13 @@ def run_poll_only(
     pump_address: int,
     timeout: float,
     poll_count: int,
+    args: argparse.Namespace,
 ) -> bytes:
     last_reply = b""
     for poll_index in range(1, poll_count + 1):
         poll = build_poll(pump_address)
         print(f"Sending POLL {poll_index}: {hexdump(poll)}")
-        reply = try_handshake(ser, poll, timeout_seconds=timeout)
+        reply = try_handshake(ser, poll, timeout_seconds=timeout, args=args)
         if not reply:
             continue
 
@@ -431,8 +515,91 @@ def run_poll_only(
             ack = build_ack(pump_address, long_seq)
             print(f"Sending ACK for seq={long_seq}: {hexdump(ack)}")
             ser.reset_input_buffer()
+            if args.pre_tx_delay > 0:
+                time.sleep(args.pre_tx_delay)
             ser.write(ack)
             ser.flush()
+            if args.post_tx_delay > 0:
+                time.sleep(args.post_tx_delay)
+
+    return last_reply
+
+
+def run_pts_style_replay(
+    ser: serial.Serial,
+    pump_address: int,
+    sequence: int,
+    timeout: float,
+    args: argparse.Namespace,
+) -> bytes:
+    last_reply = b""
+
+    print("PTS replay step 1: initial POLL")
+    first_poll_reply = try_handshake(
+        ser,
+        build_poll(pump_address),
+        timeout_seconds=timeout,
+        args=args,
+    )
+    if first_poll_reply:
+        decode_and_print_reply(first_poll_reply)
+        last_reply = first_poll_reply
+        long_seq = get_long_frame_sequence(first_poll_reply)
+        if long_seq is not None:
+            ack = build_ack(pump_address, long_seq)
+            print(f"Sending ACK for seq={long_seq}: {hexdump(ack)}")
+            if args.pre_tx_delay > 0:
+                time.sleep(args.pre_tx_delay)
+            ser.write(ack)
+            ser.flush()
+            if args.post_tx_delay > 0:
+                time.sleep(args.post_tx_delay)
+
+    if args.replay_step_delay > 0:
+        time.sleep(args.replay_step_delay)
+
+    command = build_line_frame(
+        pump_address=pump_address,
+        payload=build_return_status_transaction(),
+        sequence=sequence,
+        crc_name="dart",
+    )
+    print(f"PTS replay step 2: RETURN STATUS seq={sequence}: {hexdump(command)}")
+    command_reply = try_handshake(
+        ser,
+        command,
+        timeout_seconds=timeout,
+        args=args,
+    )
+    if command_reply:
+        decode_and_print_reply(command_reply)
+        last_reply = command_reply
+
+    if args.replay_step_delay > 0:
+        time.sleep(args.replay_step_delay)
+
+    print("PTS replay step 3: follow-up POLL")
+    poll_reply = try_handshake(
+        ser,
+        build_poll(pump_address),
+        timeout_seconds=timeout,
+        args=args,
+    )
+    if not poll_reply:
+        return last_reply
+
+    decode_and_print_reply(poll_reply)
+    last_reply = poll_reply
+    long_seq = get_long_frame_sequence(poll_reply)
+    if long_seq is not None:
+        ack = build_ack(pump_address, long_seq)
+        print(f"PTS replay step 4: ACK seq={long_seq}: {hexdump(ack)}")
+        if args.pre_tx_delay > 0:
+            time.sleep(args.pre_tx_delay)
+        ser.write(ack)
+        ser.flush()
+        if args.post_tx_delay > 0:
+            time.sleep(args.post_tx_delay)
 
     return last_reply
 
@@ -449,6 +616,19 @@ def probe_with_serial_profile(
     args: argparse.Namespace,
 ) -> bytes:
     print(f"Opening {port} @ {baudrate},{bytesize}{parity}{int(stopbits)}")
+    if args.rs485_mode:
+        print(
+            "RS485 mode enabled "
+            f"(rts_tx={args.rs485_rts_level_tx}, "
+            f"rts_rx={args.rs485_rts_level_rx}, "
+            f"delay_before_tx={args.rs485_delay_before_tx}, "
+            f"delay_before_rx={args.rs485_delay_before_rx})"
+        )
+    if args.pre_tx_delay or args.post_tx_delay:
+        print(
+            f"Manual TX delays: pre={args.pre_tx_delay}s "
+            f"post={args.post_tx_delay}s"
+        )
     with open_serial_profile(
         port=port,
         baudrate=baudrate,
@@ -456,7 +636,27 @@ def probe_with_serial_profile(
         parity=parity,
         stopbits=stopbits,
         timeout=timeout,
+        args=args,
     ) as ser:
+        if args.replay_pts_status:
+            addresses = range(0x50, 0x70) if args.scan_addresses else [pump_address]
+            sequences = range(16) if args.try_all_sequences else [args.replay_sequence]
+            for address in addresses:
+                for sequence in sequences:
+                    print(f"Trying PTS replay addr=0x{address:02X} seq={sequence}")
+                    reply = run_pts_style_replay(
+                        ser=ser,
+                        pump_address=address,
+                        sequence=sequence,
+                        timeout=timeout,
+                        args=args,
+                    )
+                    if reply:
+                        print(f"Response received with PTS replay addr=0x{address:02X} seq={sequence}")
+                        return reply
+                    time.sleep(0.2)
+            return b""
+
         if args.poll_only:
             addresses = range(0x50, 0x70) if args.scan_addresses else [pump_address]
             for address in addresses:
@@ -466,6 +666,7 @@ def probe_with_serial_profile(
                     pump_address=address,
                     timeout=timeout,
                     poll_count=args.poll_count,
+                    args=args,
                 )
                 if reply:
                     print(f"Response received with POLL addr=0x{address:02X}")
@@ -476,7 +677,7 @@ def probe_with_serial_profile(
         if args.raw_payload:
             request = transaction
             print(f"Handshake request: {hexdump(request)}")
-            return try_handshake(ser, request, timeout_seconds=timeout)
+            return try_handshake(ser, request, timeout_seconds=timeout, args=args)
 
         addresses = range(0x50, 0x70) if args.scan_addresses else [pump_address]
         sequences = range(16) if args.try_all_sequences else [args.sequence]
@@ -493,6 +694,7 @@ def probe_with_serial_profile(
                         crc_name=crc_name,
                         timeout=timeout,
                         poll_count=args.poll_count,
+                        args=args,
                     )
                     if reply:
                         print(f"Response received with addr=0x{address:02X} seq={sequence} crc={crc_name}")
@@ -518,6 +720,23 @@ def main() -> int:
     )
     parser.add_argument("--sequence", type=int, default=1, help="Low nibble of control/seq byte")
     parser.add_argument("--poll-count", type=int, default=2, help="How many POLL requests to send after the command")
+    parser.add_argument(
+        "--replay-pts-status",
+        action="store_true",
+        help="Replay a PTS-like status sequence: POLL, RETURN STATUS, POLL, ACK",
+    )
+    parser.add_argument(
+        "--replay-sequence",
+        type=int,
+        default=8,
+        help="Sequence nibble to use for --replay-pts-status",
+    )
+    parser.add_argument(
+        "--replay-step-delay",
+        type=float,
+        default=0.0,
+        help="Extra delay between replay steps",
+    )
     parser.add_argument(
         "--poll-only",
         action="store_true",
@@ -553,6 +772,49 @@ def main() -> int:
         type=float,
         default=0.0,
         help="Listen only for incoming traffic for N seconds",
+    )
+    parser.add_argument(
+        "--rs485-mode",
+        action="store_true",
+        help="Enable pyserial/Linux RS485Settings on the port",
+    )
+    parser.add_argument(
+        "--rs485-rts-level-tx",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="RTS level while transmitting when --rs485-mode is enabled",
+    )
+    parser.add_argument(
+        "--rs485-rts-level-rx",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="RTS level while receiving when --rs485-mode is enabled",
+    )
+    parser.add_argument(
+        "--rs485-delay-before-tx",
+        type=float,
+        default=0.0,
+        help="Delay before TX when --rs485-mode is enabled",
+    )
+    parser.add_argument(
+        "--rs485-delay-before-rx",
+        type=float,
+        default=0.0,
+        help="Delay before RX when --rs485-mode is enabled",
+    )
+    parser.add_argument(
+        "--pre-tx-delay",
+        type=float,
+        default=0.0,
+        help="Manual sleep before every transmit",
+    )
+    parser.add_argument(
+        "--post-tx-delay",
+        type=float,
+        default=0.0,
+        help="Manual sleep after every transmit before reading",
     )
     args = parser.parse_args()
 

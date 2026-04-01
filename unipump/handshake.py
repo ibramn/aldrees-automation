@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Best-effort UNIMEP handshake tester for Raspberry Pi + USB-RS485.
+
+This script is based on the application-layer details in `UnimepProtocol.pdf`.
+That document says CRC, parity, and block sequence belong to the lower "line
+protocol" and does not fully define them, so the line frame used here is an
+assumption based on the examples in the PDF:
+
+- Pump address: 0x50-0x6F
+- Control/sequence byte: 0x30 | (seq & 0x0F)
+- Command transaction: CD1 = 0x01, LEN = 0x01, DCC = 0x00 (RETURN STATUS)
+- Trailer bytes: CRC low, CRC high, ETX=0x03, SF=0xFA
+
+If your pump does not answer, the most likely mismatch is the CRC algorithm,
+serial parameters, or the exact line-protocol framing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from typing import Iterable
+
+import serial
+
+
+STATUS_NAMES = {
+    0x00: "PUMP NOT PROGRAMMED",
+    0x01: "RESET",
+    0x02: "AUTHORIZED",
+    0x04: "FILLING",
+    0x05: "FILLING COMPLETED",
+    0x06: "MAX AMOUNT/VOLUME REACHED",
+    0x07: "SWITCHED OFF",
+    0x0B: "PAUSED",
+}
+
+ETX = 0x03
+SF = 0xFA
+
+
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
+
+
+def crc16_ccitt_false(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def crc16_x25(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0x8408
+            else:
+                crc >>= 1
+    return (~crc) & 0xFFFF
+
+
+CRC_FUNCTIONS = {
+    "modbus": crc16_modbus,
+    "ccitt-false": crc16_ccitt_false,
+    "x25": crc16_x25,
+    "none": lambda _data: 0,
+}
+
+
+def hexdump(data: bytes) -> str:
+    return " ".join(f"{byte:02X}" for byte in data)
+
+
+def packed_bcd_to_int(data: Iterable[int]) -> int:
+    digits = []
+    for byte in data:
+        hi = (byte >> 4) & 0x0F
+        lo = byte & 0x0F
+        if hi > 9 or lo > 9:
+            raise ValueError(f"invalid packed BCD byte: 0x{byte:02X}")
+        digits.append(str(hi))
+        digits.append(str(lo))
+    return int("".join(digits))
+
+
+def format_bcd_value(data: bytes, decimal_places: int) -> str:
+    value = packed_bcd_to_int(data)
+    if decimal_places <= 0:
+        return str(value)
+    scale = 10**decimal_places
+    whole = value // scale
+    frac = value % scale
+    return f"{whole}.{frac:0{decimal_places}d}"
+
+
+def build_return_status_transaction() -> bytes:
+    # CD1, len=1, DCC=0x00 (RETURN STATUS)
+    return bytes([0x01, 0x01, 0x00])
+
+
+def build_line_frame(
+    pump_address: int,
+    payload: bytes,
+    sequence: int,
+    crc_name: str,
+) -> bytes:
+    ctrl_seq = 0x30 | (sequence & 0x0F)
+    body = bytes([pump_address, ctrl_seq]) + payload
+    crc_value = CRC_FUNCTIONS[crc_name](body)
+    crc_lo = crc_value & 0xFF
+    crc_hi = (crc_value >> 8) & 0xFF
+    return body + bytes([crc_lo, crc_hi, ETX, SF])
+
+
+def parse_transactions(payload: bytes) -> list[str]:
+    messages: list[str] = []
+    idx = 0
+    while idx + 2 <= len(payload):
+        trans = payload[idx]
+        data_len = payload[idx + 1]
+        start = idx + 2
+        end = start + data_len
+        if end > len(payload):
+            messages.append(
+                f"incomplete transaction 0x{trans:02X}: need {data_len} bytes, "
+                f"have {len(payload) - start}"
+            )
+            break
+
+        data = payload[start:end]
+        if trans == 0x01 and data_len == 1:
+            status = data[0]
+            messages.append(
+                f"DC1 Pump status: 0x{status:02X} "
+                f"({STATUS_NAMES.get(status, 'UNKNOWN')})"
+            )
+        elif trans == 0x02 and data_len == 8:
+            volume = format_bcd_value(data[:4], decimal_places=2)
+            amount = format_bcd_value(data[4:], decimal_places=2)
+            messages.append(f"DC2 Filled volume/amount: volume={volume}, amount={amount}")
+        elif trans == 0x03 and data_len == 4:
+            price = format_bcd_value(data[:3], decimal_places=3)
+            nozio = data[3]
+            nozzle = nozio & 0x0F
+            nozzle_out = bool(nozio & 0x10)
+            messages.append(
+                "DC3 Nozzle status/filling price: "
+                f"price={price}, nozzle={nozzle}, nozzle_state={'out' if nozzle_out else 'in'}"
+            )
+        elif trans == 0x65 and data_len == 11:
+            nozzle = data[0]
+            total_volume = format_bcd_value(data[1:6], decimal_places=2)
+            total_grade_1 = format_bcd_value(data[6:11], decimal_places=2)
+            messages.append(
+                "DC101 Volume total counters: "
+                f"nozzle={nozzle}, total_volume={total_volume}, total_grade_1={total_grade_1}"
+            )
+        else:
+            messages.append(
+                f"unknown transaction 0x{trans:02X} len={data_len}: {hexdump(data)}"
+            )
+
+        idx = end
+
+    if idx < len(payload):
+        messages.append(f"trailing bytes: {hexdump(payload[idx:])}")
+
+    return messages
+
+
+def extract_payload_from_reply(reply: bytes) -> bytes:
+    if len(reply) >= 4 and reply[-2:] == bytes([ETX, SF]):
+        # Assumed format: ADR, CTRL/SEQ, PAYLOAD..., CRC_LO, CRC_HI, ETX, SF
+        if len(reply) >= 6:
+            return reply[2:-4]
+        return b""
+    # Fallback: parse whole buffer as transactions if the device returns raw payload.
+    return reply
+
+
+def open_serial(args: argparse.Namespace) -> serial.Serial:
+    parity_map = {
+        "N": serial.PARITY_NONE,
+        "E": serial.PARITY_EVEN,
+        "O": serial.PARITY_ODD,
+    }
+    return serial.Serial(
+        port=args.port,
+        baudrate=args.baudrate,
+        bytesize=serial.EIGHTBITS,
+        parity=parity_map[args.parity],
+        stopbits=args.stopbits,
+        timeout=args.timeout,
+        write_timeout=args.timeout,
+    )
+
+
+def read_reply(ser: serial.Serial, timeout_seconds: float) -> bytes:
+    deadline = time.monotonic() + timeout_seconds
+    received = bytearray()
+    while time.monotonic() < deadline:
+        chunk = ser.read(256)
+        if chunk:
+            received.extend(chunk)
+            if received.endswith(bytes([ETX, SF])):
+                break
+        else:
+            time.sleep(0.05)
+    return bytes(received)
+
+
+def try_handshake(
+    ser: serial.Serial,
+    request: bytes,
+    timeout_seconds: float,
+) -> bytes:
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    ser.write(request)
+    ser.flush()
+    return read_reply(ser, timeout_seconds=timeout_seconds)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="UNIMEP handshake tester")
+    parser.add_argument("--port", required=True, help="Serial port, e.g. /dev/ttyUSB0")
+    parser.add_argument("--pump-address", default="0x50", help="Pump address 0x50-0x6F")
+    parser.add_argument("--baudrate", type=int, default=9600)
+    parser.add_argument("--parity", choices=["N", "E", "O"], default="N")
+    parser.add_argument("--stopbits", type=float, choices=[1, 2], default=1)
+    parser.add_argument("--timeout", type=float, default=1.0)
+    parser.add_argument(
+        "--crc",
+        choices=sorted(CRC_FUNCTIONS.keys()),
+        default="modbus",
+        help="Assumed line-protocol CRC",
+    )
+    parser.add_argument("--sequence", type=int, default=0, help="Low nibble of control/seq byte")
+    parser.add_argument(
+        "--raw-payload",
+        action="store_true",
+        help="Send only the application transaction, without assumed line framing",
+    )
+    parser.add_argument(
+        "--try-all-crc",
+        action="store_true",
+        help="Try all built-in CRC variants until the pump replies",
+    )
+    args = parser.parse_args()
+
+    try:
+        pump_address = int(args.pump_address, 0)
+    except ValueError as exc:
+        print(f"invalid pump address: {args.pump_address} ({exc})", file=sys.stderr)
+        return 2
+
+    if not (0x50 <= pump_address <= 0x6F):
+        print("pump address must be between 0x50 and 0x6F", file=sys.stderr)
+        return 2
+
+    transaction = build_return_status_transaction()
+    print(f"Opening {args.port} @ {args.baudrate},{args.parity},{int(args.stopbits)}")
+
+    try:
+        with open_serial(args) as ser:
+            if args.raw_payload:
+                request = transaction
+                print(f"Handshake request: {hexdump(request)}")
+                reply = try_handshake(ser, request, timeout_seconds=args.timeout)
+            elif args.try_all_crc:
+                reply = b""
+                for crc_name in CRC_FUNCTIONS:
+                    request = build_line_frame(
+                        pump_address=pump_address,
+                        payload=transaction,
+                        sequence=args.sequence,
+                        crc_name=crc_name,
+                    )
+                    print(f"Trying CRC={crc_name}: {hexdump(request)}")
+                    reply = try_handshake(ser, request, timeout_seconds=args.timeout)
+                    if reply:
+                        print(f"Reply received with CRC={crc_name}")
+                        break
+                    time.sleep(0.2)
+            else:
+                request = build_line_frame(
+                    pump_address=pump_address,
+                    payload=transaction,
+                    sequence=args.sequence,
+                    crc_name=args.crc,
+                )
+                print(f"Handshake request: {hexdump(request)}")
+                reply = try_handshake(ser, request, timeout_seconds=args.timeout)
+    except serial.SerialException as exc:
+        print(f"serial error: {exc}", file=sys.stderr)
+        return 1
+
+    if not reply:
+        print("No reply received.")
+        print("Try a different --crc, --baudrate, --parity, or --raw-payload.")
+        return 1
+
+    print(f"Raw reply: {hexdump(reply)}")
+    payload = extract_payload_from_reply(reply)
+    decoded = parse_transactions(payload)
+
+    if decoded:
+        for line in decoded:
+            print(f"- {line}")
+    else:
+        print("No decodable transactions found in reply payload.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

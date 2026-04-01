@@ -201,10 +201,14 @@ def open_serial(args: argparse.Namespace) -> serial.Serial:
         "E": serial.PARITY_EVEN,
         "O": serial.PARITY_ODD,
     }
+    bytesize_map = {
+        7: serial.SEVENBITS,
+        8: serial.EIGHTBITS,
+    }
     return serial.Serial(
         port=args.port,
         baudrate=args.baudrate,
-        bytesize=serial.EIGHTBITS,
+        bytesize=bytesize_map[args.bytesize],
         parity=parity_map[args.parity],
         stopbits=args.stopbits,
         timeout=args.timeout,
@@ -243,6 +247,7 @@ def main() -> int:
     parser.add_argument("--port", required=True, help="Serial port, e.g. /dev/ttyUSB0")
     parser.add_argument("--pump-address", default="0x50", help="Pump address 0x50-0x6F")
     parser.add_argument("--baudrate", type=int, default=9600)
+    parser.add_argument("--bytesize", type=int, choices=[7, 8], default=8)
     parser.add_argument("--parity", choices=["N", "E", "O"], default="N")
     parser.add_argument("--stopbits", type=float, choices=[1, 2], default=1)
     parser.add_argument("--timeout", type=float, default=1.0)
@@ -263,6 +268,16 @@ def main() -> int:
         action="store_true",
         help="Try all built-in CRC variants until the pump replies",
     )
+    parser.add_argument(
+        "--try-all-sequences",
+        action="store_true",
+        help="Try sequence/control low nibble values 0..15",
+    )
+    parser.add_argument(
+        "--scan-addresses",
+        action="store_true",
+        help="Try all pump addresses from 0x50 to 0x6F",
+    )
     args = parser.parse_args()
 
     try:
@@ -276,7 +291,10 @@ def main() -> int:
         return 2
 
     transaction = build_return_status_transaction()
-    print(f"Opening {args.port} @ {args.baudrate},{args.parity},{int(args.stopbits)}")
+    print(
+        f"Opening {args.port} @ "
+        f"{args.baudrate},{args.bytesize}{args.parity}{int(args.stopbits)}"
+    )
 
     try:
         with open_serial(args) as ser:
@@ -284,37 +302,51 @@ def main() -> int:
                 request = transaction
                 print(f"Handshake request: {hexdump(request)}")
                 reply = try_handshake(ser, request, timeout_seconds=args.timeout)
-            elif args.try_all_crc:
-                reply = b""
-                for crc_name in CRC_FUNCTIONS:
-                    request = build_line_frame(
-                        pump_address=pump_address,
-                        payload=transaction,
-                        sequence=args.sequence,
-                        crc_name=crc_name,
-                    )
-                    print(f"Trying CRC={crc_name}: {hexdump(request)}")
-                    reply = try_handshake(ser, request, timeout_seconds=args.timeout)
-                    if reply:
-                        print(f"Reply received with CRC={crc_name}")
-                        break
-                    time.sleep(0.2)
             else:
-                request = build_line_frame(
-                    pump_address=pump_address,
-                    payload=transaction,
-                    sequence=args.sequence,
-                    crc_name=args.crc,
-                )
-                print(f"Handshake request: {hexdump(request)}")
-                reply = try_handshake(ser, request, timeout_seconds=args.timeout)
+                reply = b""
+                addresses = range(0x50, 0x70) if args.scan_addresses else [pump_address]
+                sequences = range(16) if args.try_all_sequences else [args.sequence]
+                crc_names = CRC_FUNCTIONS.keys() if args.try_all_crc else [args.crc]
+
+                for address in addresses:
+                    for sequence in sequences:
+                        for crc_name in crc_names:
+                            request = build_line_frame(
+                                pump_address=address,
+                                payload=transaction,
+                                sequence=sequence,
+                                crc_name=crc_name,
+                            )
+                            print(
+                                f"Trying addr=0x{address:02X} seq={sequence} "
+                                f"crc={crc_name}: {hexdump(request)}"
+                            )
+                            reply = try_handshake(
+                                ser,
+                                request,
+                                timeout_seconds=args.timeout,
+                            )
+                            if reply:
+                                print(
+                                    f"Reply received with addr=0x{address:02X} "
+                                    f"seq={sequence} crc={crc_name}"
+                                )
+                                break
+                            time.sleep(0.2)
+                        if reply:
+                            break
+                    if reply:
+                        break
     except serial.SerialException as exc:
         print(f"serial error: {exc}", file=sys.stderr)
         return 1
 
     if not reply:
         print("No reply received.")
-        print("Try a different --crc, --baudrate, --parity, or --raw-payload.")
+        print(
+            "Try different serial settings, "
+            "--scan-addresses, --try-all-sequences, or --raw-payload."
+        )
         return 1
 
     print(f"Raw reply: {hexdump(reply)}")

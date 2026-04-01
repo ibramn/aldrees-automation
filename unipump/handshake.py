@@ -303,19 +303,33 @@ def split_stream_frames(data: bytes) -> list[bytes]:
     return frames
 
 
-def apply_rs485_mode(ser: serial.Serial, args: argparse.Namespace) -> None:
+def apply_rs485_mode(ser: serial.Serial, args: argparse.Namespace) -> bool:
     if not args.rs485_mode:
-        return
+        return False
     if RS485Settings is None:
-        raise RuntimeError("pyserial RS485Settings is not available on this system")
+        print(
+            "Warning: pyserial RS485Settings is not available on this system; "
+            "continuing without kernel RS485 mode.",
+            file=sys.stderr,
+        )
+        return False
 
-    ser.rs485_mode = RS485Settings(
-        rts_level_for_tx=bool(args.rs485_rts_level_tx),
-        rts_level_for_rx=bool(args.rs485_rts_level_rx),
-        loopback=False,
-        delay_before_tx=args.rs485_delay_before_tx or None,
-        delay_before_rx=args.rs485_delay_before_rx or None,
-    )
+    try:
+        ser.rs485_mode = RS485Settings(
+            rts_level_for_tx=bool(args.rs485_rts_level_tx),
+            rts_level_for_rx=bool(args.rs485_rts_level_rx),
+            loopback=False,
+            delay_before_tx=args.rs485_delay_before_tx or None,
+            delay_before_rx=args.rs485_delay_before_rx or None,
+        )
+        return True
+    except (ValueError, OSError, AttributeError) as exc:
+        print(
+            "Warning: adapter/driver does not support kernel RS485 mode "
+            f"({exc}); continuing without it.",
+            file=sys.stderr,
+        )
+        return False
 
 
 def open_serial_profile(
@@ -618,7 +632,7 @@ def probe_with_serial_profile(
     print(f"Opening {port} @ {baudrate},{bytesize}{parity}{int(stopbits)}")
     if args.rs485_mode:
         print(
-            "RS485 mode enabled "
+            "RS485 mode requested "
             f"(rts_tx={args.rs485_rts_level_tx}, "
             f"rts_rx={args.rs485_rts_level_rx}, "
             f"delay_before_tx={args.rs485_delay_before_tx}, "

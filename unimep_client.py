@@ -111,13 +111,12 @@ def decode_bcd3_3dp(data: bytes) -> Decimal:
 
 def crc16_unimep(data: bytes) -> int:
     """
-    PLACEHOLDER.
-    Replace with the correct CRC once you confirm the exact variant.
-
-    This implementation uses CRC-16/IBM (Modbus-like polynomial),
-    init=0xFFFF, poly=0xA001, little-endian output.
+    UNIMEP line framing uses CRC-16/IBM reflected with init=0x0000.
+    Captured frames such as:
+    50 30 01 01 05 03 04 00 23 30 01 4D 5B 03 FA
+    validate as CRC_LO=0x4D, CRC_HI=0x5B with this variant.
     """
-    crc = 0xFFFF
+    crc = 0x0000
     for byte in data:
         crc ^= byte
         for _ in range(8):

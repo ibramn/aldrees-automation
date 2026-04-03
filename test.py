@@ -7,10 +7,15 @@ import serial
 PORT = "/dev/ttyAMA0"
 ADDR = 0x50
 DE_RE = 17
-PRE_TX_DELAY = 0.002
-POST_TX_DELAY = 0.02
+PRE_TX_DELAY = 0.001
+POST_TX_DELAY = 0.0
 READ_TIMEOUT = 1.0
 IDLE_GAP = 0.15
+EXCHANGES_PER_PROFILE = 4
+PROFILES = [
+    ("8N1", serial.EIGHTBITS, serial.PARITY_NONE, serial.STOPBITS_ONE),
+    ("7E1", serial.SEVENBITS, serial.PARITY_EVEN, serial.STOPBITS_ONE),
+]
 
 
 def hx(data: bytes) -> str:
@@ -45,7 +50,7 @@ def build_return_status(seq: int) -> bytes:
     return body + bytes([crc & 0xFF, (crc >> 8) & 0xFF, 0x03, 0xFA])
 
 
-def read_reply_window(timeout: float = READ_TIMEOUT, idle_gap: float = IDLE_GAP) -> bytes:
+def read_reply_window(ser: serial.Serial, timeout: float = READ_TIMEOUT, idle_gap: float = IDLE_GAP) -> bytes:
     deadline = time.monotonic() + timeout
     buf = bytearray()
     last_data_at = None
@@ -92,58 +97,92 @@ def split_frames(stream: bytes) -> list[bytes]:
     return frames
 
 
-def tx(frame: bytes) -> None:
+def tx(ser: serial.Serial, frame: bytes) -> None:
     GPIO.output(DE_RE, 1)
     time.sleep(PRE_TX_DELAY)
     ser.reset_input_buffer()
     ser.write(frame)
     ser.flush()
-    time.sleep(POST_TX_DELAY)
+    if POST_TX_DELAY > 0:
+        time.sleep(POST_TX_DELAY)
     GPIO.output(DE_RE, 0)
     print("TX", hx(frame))
+
+
+def open_serial(bytesize: int, parity: str, stopbits: float) -> serial.Serial:
+    return serial.Serial(
+        PORT,
+        baudrate=9600,
+        bytesize=bytesize,
+        parity=parity,
+        stopbits=stopbits,
+        timeout=0.05,
+        write_timeout=0.5,
+    )
+
+
+def run_exchange(ser: serial.Serial, seq: int) -> tuple[int, int]:
+    rx_count = 0
+
+    tx(ser, build_return_status(seq))
+    raw = read_reply_window(ser, timeout=0.8)
+    frames = split_frames(raw)
+    if frames:
+        for frame in frames:
+            print("RX", hx(frame))
+            rx_count += 1
+    else:
+        print("RX", hx(raw), "LEN=", len(raw))
+
+    tx(ser, build_poll())
+    raw = read_reply_window(ser, timeout=0.8)
+    frames = split_frames(raw)
+    if frames:
+        for frame in frames:
+            print("RX", hx(frame))
+            rx_count += 1
+            if len(frame) >= 4 and (frame[1] & 0xF0) == 0x30 and frame[-2:] == b"\x03\xFA":
+                ack = build_ack(frame[1] & 0x0F)
+                tx(ser, ack)
+    else:
+        print("RX", hx(raw), "LEN=", len(raw))
+
+    seq = 1 if seq >= 0x0F else seq + 1
+    return seq, rx_count
 
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(DE_RE, GPIO.OUT)
 GPIO.output(DE_RE, 0)
 
-ser = serial.Serial(
-    PORT,
-    baudrate=9600,
-    bytesize=serial.EIGHTBITS,
-    parity=serial.PARITY_NONE,
-    stopbits=serial.STOPBITS_ONE,
-    timeout=0.05,
-    write_timeout=0.5,
-)
-
 seq = 1
 
 try:
+    profile_index = 0
     while True:
-        tx(build_return_status(seq))
-        raw = read_reply_window(timeout=0.8)
-        frames = split_frames(raw)
-        if frames:
-            for frame in frames:
-                print("RX", hx(frame))
-        else:
-            print("RX", hx(raw), "LEN=", len(raw))
+        profile_name, bytesize, parity, stopbits = PROFILES[profile_index]
+        print(f"\n=== Testing {profile_name} on {PORT} ===")
 
-        tx(build_poll())
-        raw = read_reply_window(timeout=0.8)
-        frames = split_frames(raw)
-        if frames:
-            for frame in frames:
-                print("RX", hx(frame))
-                if len(frame) >= 4 and (frame[1] & 0xF0) == 0x30 and frame[-2:] == b"\x03\xFA":
-                    ack = build_ack(frame[1] & 0x0F)
-                    tx(ack)
-        else:
-            print("RX", hx(raw), "LEN=", len(raw))
+        ser = open_serial(bytesize, parity, stopbits)
+        profile_rx = 0
+        try:
+            for _ in range(EXCHANGES_PER_PROFILE):
+                seq, rx_count = run_exchange(ser, seq)
+                profile_rx += rx_count
+                time.sleep(1)
+        finally:
+            ser.close()
 
-        seq = 1 if seq >= 0x0F else seq + 1
-        time.sleep(1)
+        if profile_rx:
+            print(f"RX detected on {profile_name}; staying on this profile.")
+            ser = open_serial(bytesize, parity, stopbits)
+            try:
+                while True:
+                    seq, _ = run_exchange(ser, seq)
+                    time.sleep(1)
+            finally:
+                ser.close()
+
+        profile_index = (profile_index + 1) % len(PROFILES)
 finally:
-    ser.close()
     GPIO.cleanup()

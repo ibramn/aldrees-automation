@@ -1,31 +1,27 @@
 import serial
-import binascii
+import RPi.GPIO as GPIO
 import time
 
-PORT = "/dev/ttyUSB0"
+DE_RE = 17
 
-def hx(b: bytes) -> str:
-    return binascii.hexlify(b, sep=" ").decode().upper()
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(DE_RE, GPIO.OUT)
 
-ser = serial.Serial(
-    PORT,
-    baudrate=9600,
-    bytesize=serial.EIGHTBITS,
-    parity=serial.PARITY_NONE,
-    stopbits=serial.STOPBITS_ONE,
-    timeout=2,
-    write_timeout=1
-)
+ser = serial.Serial("/dev/serial0", 9600, timeout=1)
 
-try:
-    frame = bytes([0x50, 0x20, 0xFA])
-    print("TX", hx(frame))
-    ser.write(frame)
+def send(data):
+    GPIO.output(DE_RE, 1)  # TX mode
+    time.sleep(0.001)
+    ser.write(data)
     ser.flush()
+    time.sleep(0.01)
+    GPIO.output(DE_RE, 0)  # RX mode
 
-    time.sleep(0.3)
+def read():
+    return ser.read(100)
 
-    data = ser.read(100)
-    print("RX", hx(data), "LEN=", len(data))
-finally:
-    ser.close()
+while True:
+    send(b'\x50\x20\xFA')
+    time.sleep(0.2)
+    print(read())
+    time.sleep(1)

@@ -2,7 +2,7 @@ import serial
 import time
 import binascii
 
-PORT = "/dev/serial0"   # or /dev/ttyAMA0
+PORT = "/dev/ttyAMA0"   # or /dev/ttyAMA0
 BAUD = 9600
 
 def hx(data: bytes) -> str:

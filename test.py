@@ -97,6 +97,16 @@ def split_frames(stream: bytes) -> list[bytes]:
     return frames
 
 
+def filter_echo(frames: list[bytes], expected_echo: bytes) -> list[bytes]:
+    filtered = []
+    for frame in frames:
+        if frame == expected_echo:
+            print("ECHO", hx(frame))
+            continue
+        filtered.append(frame)
+    return filtered
+
+
 def tx(ser: serial.Serial, frame: bytes) -> None:
     GPIO.output(DE_RE, 1)
     time.sleep(PRE_TX_DELAY)
@@ -124,19 +134,21 @@ def open_serial(bytesize: int, parity: str, stopbits: float) -> serial.Serial:
 def run_exchange(ser: serial.Serial, seq: int) -> tuple[int, int]:
     rx_count = 0
 
-    tx(ser, build_return_status(seq))
+    return_status = build_return_status(seq)
+    tx(ser, return_status)
     raw = read_reply_window(ser, timeout=0.8)
-    frames = split_frames(raw)
+    frames = filter_echo(split_frames(raw), return_status)
     if frames:
         for frame in frames:
             print("RX", hx(frame))
             rx_count += 1
     else:
-        print("RX", hx(raw), "LEN=", len(raw))
+        print("RX", "LEN=0 (no external reply)")
 
-    tx(ser, build_poll())
+    poll = build_poll()
+    tx(ser, poll)
     raw = read_reply_window(ser, timeout=0.8)
-    frames = split_frames(raw)
+    frames = filter_echo(split_frames(raw), poll)
     if frames:
         for frame in frames:
             print("RX", hx(frame))
@@ -145,7 +157,7 @@ def run_exchange(ser: serial.Serial, seq: int) -> tuple[int, int]:
                 ack = build_ack(frame[1] & 0x0F)
                 tx(ser, ack)
     else:
-        print("RX", hx(raw), "LEN=", len(raw))
+        print("RX", "LEN=0 (no external reply)")
 
     seq = 1 if seq >= 0x0F else seq + 1
     return seq, rx_count

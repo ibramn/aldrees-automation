@@ -9,7 +9,7 @@ GPIO.setmode(GPIO.BCM)
 GPIO.setup(DE_RE, GPIO.OUT)
 GPIO.output(DE_RE, 0)
 
-ser = serial.Serial("/dev/serial0", 9600, timeout=1)
+ser = serial.Serial("/dev/ttyAMA0", 9600, timeout=1)
 
 def hx(b):
     return binascii.hexlify(b, sep=' ').decode().upper()
